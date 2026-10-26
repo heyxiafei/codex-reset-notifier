@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -9,15 +10,14 @@ from pathlib import Path
 
 from .events import notices, timestamp
 from .source import AIHot, MAX_BYTES, SourceError
-from .store import ProcessLock, Store
+from .store import ProcessLock, Store, readonly_status, private_file
+from .preview import cached_preview
 
 
 def load_env(path):
     if path is None:
         return
-    config = Path(path)
-    if config.is_symlink() or not config.is_file() or config.stat().st_mode & 0o077:
-        raise ValueError("env_file_must_be_regular_private_0600")
+    config = private_file(Path(path))
     if config.stat().st_size > 32768:
         raise ValueError("env_file_too_large")
     allowed = {"NOTIFIER_CHANNELS", "NOTIFIER_STATE_DIR", "NOTIFIER_POLL_SECONDS",
@@ -104,8 +104,9 @@ def tick(store, channels, source, now, minimum_interval=600):
     return {"source": "not_modified" if payload is None else "ok", "results": results}
 
 
-def preview(args, now, directory):
+def preview(args, now, directory, interval=600):
     cutoff = now
+    source_state, checked_at = "fixture", None
     if args.fixture:
         path = Path(args.fixture)
         if path.stat().st_size > MAX_BYTES:
@@ -115,18 +116,18 @@ def preview(args, now, directory):
             cutoff, now = timestamp(payload.get("_testCutoff")), timestamp(payload.get("_testNow"))
             if cutoff is None or now is None or cutoff > now:
                 raise ValueError("fixture_clock_missing")
-    else:
-        payload, _ = AIHot().fetch()
     if not args.preview_fixture:
-        path = Path(directory) / "outbox.sqlite3"
-        if path.exists():
-            import sqlite3
-            with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
-                row = db.execute("SELECT value FROM meta WHERE key='cutoff'").fetchone()
-                cutoff = timestamp(row[0]) if row else now
+        summary = readonly_status(directory)
+        if summary.get("initialized"):
+            cutoff = timestamp(summary.get("cutoff"))
+            if cutoff is None:
+                raise ValueError("invalid_cutoff")
+    if not args.fixture:
+        payload, source_state, checked_at = cached_preview(directory, AIHot(), cutoff, now, interval)
     found = list(notices(payload, cutoff, now))
     print(json.dumps({"dry_run": True, "simulation": args.preview_fixture, "count": len(found),
-                      "cutoff": cutoff.isoformat(), "messages": [n.text for n in found]}, ensure_ascii=False))
+                      "cutoff": cutoff.isoformat(), "source": source_state, "checked_at": checked_at,
+                      "messages": [n.text for n in found]}, ensure_ascii=False))
     return 0
 
 
@@ -154,14 +155,14 @@ def main(argv=None):
         now = datetime.now(timezone.utc)
         directory = Path(os.environ.get("NOTIFIER_STATE_DIR", "./state"))
         if args.command == "run" and not args.live:
-            return preview(args, now, directory)
-        if args.command == "status" and not (directory / "outbox.sqlite3").exists():
-            print(json.dumps({"initialized": False, "channels": names}))
+            return preview(args, now, directory, interval)
+        if args.command == "status":
+            print(json.dumps(readonly_status(directory)))
             return 0
         channel_map = adapters(names) if args.command == "run" else {}
         store = Store(directory, now)
         with ProcessLock(directory):
-            if args.command in {"init", "status"}:
+            if args.command == "init":
                 print(json.dumps(store.summary()))
                 return 0
             store.recover()
@@ -188,7 +189,7 @@ def main(argv=None):
                     next_poll = time.monotonic() + max(delay, source.minimum_interval)
                 # Drain leases regularly without increasing public API polling frequency.
                 time.sleep(min(60, max(0.01, next_poll - time.monotonic())))
-    except (ValueError, OSError, json.JSONDecodeError):
+    except (ValueError, OSError, UnicodeError, sqlite3.Error, json.JSONDecodeError):
         print("Configuration or local I/O failed; check permissions and required fields. No secrets logged.", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

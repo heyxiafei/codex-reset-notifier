@@ -142,6 +142,20 @@ class WxBotChannel:
         self.timeout = timeout
         self._opener = build_opener(ProxyHandler({}), _NoRedirect())
 
+    def verify_binding(self) -> SendResult:
+        """Read owner-only status before every pull, destructive ack, or send."""
+        status, body = self._inbox_request("/v1/status")
+        if status != 200 or body is None or not isinstance(body.get("bindings"), list):
+            return SendResult("needs_user_action", "wx_binding_unverified")
+        matches = [b for b in body["bindings"] if isinstance(b, dict) and b.get("name") == self.binding]
+        if len(matches) != 1:
+            return SendResult("needs_user_action", "wx_binding_unverified")
+        binding = matches[0]
+        if (binding.get("logged_in") is not True or binding.get("expired") is not False
+                or binding.get("delivery") != "pull" or binding.get("allowlist") != [self.recipient]):
+            return SendResult("needs_user_action", "wx_binding_unverified")
+        return SendResult("accepted", "wx_binding_verified")
+
     @staticmethod
     def _result(status: int, raw: bytes) -> SendResult:
         try:
@@ -163,6 +177,9 @@ class WxBotChannel:
 
     def send(self, text: str, subject: str = "AIHot Codex 重置提醒") -> SendResult:
         del subject  # Shared channel interface; WeChat sends plain text only.
+        verified = self.verify_binding()
+        if verified.state != "accepted":
+            return verified
         payload = json.dumps({"binding": self.binding, "to": self.recipient,
                               "text": text}, ensure_ascii=False).encode("utf-8")
         request = Request(self.base_url + "/v1/send", data=payload, method="POST",
@@ -174,7 +191,7 @@ class WxBotChannel:
         except HTTPError as error:
             try:
                 raw = error.read(65537)
-            except OSError:
+            except (OSError, HTTPException):
                 raw = b""
             return self._result(error.code, raw)
         except (OSError, URLError, ValueError, HTTPException):
@@ -220,9 +237,13 @@ class WxBotChannel:
         if type(max_batches) is not int or not 1 <= max_batches <= 10:
             raise ValueError("invalid wx-bot drain batch limit")
         acked = 0
+        diagnostic = None
         query = urlencode({"binding": self.binding, "limit": 100,
                            "lease": "5m", "wait": "0s"})
         for _ in range(max_batches):
+            verified = self.verify_binding()
+            if verified.state != "accepted":
+                return DrainResult(verified.state, verified.code, acked)
             status, body = self._inbox_request("/v1/events?" + query)
             if status in {400, 401, 403, 404, 409, 413}:
                 return DrainResult("needs_user_action", "wx_inbox_configuration", acked)
@@ -230,7 +251,7 @@ class WxBotChannel:
                 return DrainResult("unknown", "wx_inbox_pull_unknown", acked)
             events = body["events"]
             if not events:
-                return DrainResult("accepted", "wx_inbox_drained", acked)
+                return diagnostic or DrainResult("accepted", "wx_inbox_drained", acked)
             if len(events) > 100:
                 return DrainResult("needs_user_action", "wx_inbox_invalid_envelope", acked)
             ids = []
@@ -247,8 +268,25 @@ class WxBotChannel:
                     return DrainResult("needs_user_action", "wx_inbox_scope_mismatch", acked)
                 if event_id not in ids:
                     ids.append(event_id)
+                kind = event.get("kind")
+                if kind == "message":
+                    if event.get("from_wxid") != self.recipient:
+                        return DrainResult("needs_user_action", "wx_inbox_owner_mismatch", acked)
+                elif kind == "alert":
+                    alert = event.get("alert")
+                    code = alert.get("code") if isinstance(alert, dict) else None
+                    if (not isinstance(code, str) or code not in {"session_expired", "ilink_unreachable", "recovered"}
+                            or event.get("from_wxid") != "" or not event_id.startswith(self.binding + ":alert:" + code + ":")):
+                        return DrainResult("needs_user_action", "wx_inbox_unknown_alert", acked)
+                    if diagnostic is None or code == "session_expired" or diagnostic.code == "wx_recovered":
+                        diagnostic = DrainResult("accepted" if code == "recovered" else "needs_user_action", "wx_" + code, acked)
+                else:
+                    return DrainResult("needs_user_action", "wx_inbox_invalid_kind", acked)
             # Drop references to content before constructing the ack request.
             del event, events, body
+            verified = self.verify_binding()
+            if verified.state != "accepted":
+                return DrainResult(verified.state, verified.code, acked)
             status, body = self._inbox_request("/v1/events/ack", {"event_ids": ids})
             if status in {400, 401, 403, 404, 409, 413}:
                 return DrainResult("needs_user_action", "wx_inbox_configuration", acked)
@@ -258,4 +296,7 @@ class WxBotChannel:
             acked += body["acked"]
             if body["acked"] != len(ids):
                 return DrainResult("unknown", "wx_inbox_ack_mismatch", acked)
+            if diagnostic:
+                # Retain only the fixed diagnostic; message/hint bodies are discarded.
+                return DrainResult(diagnostic.state, diagnostic.code, acked)
         return DrainResult("accepted", "wx_inbox_batch_limit", acked)

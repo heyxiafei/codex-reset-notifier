@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
 
-from codex_reset_notifier.channels import SMTPChannel, WxBotChannel, _NoRedirect
+from codex_reset_notifier.channels import SMTPChannel, WxBotChannel, SendResult, _NoRedirect
 
 
 class SMTPTests(unittest.TestCase):
@@ -84,7 +84,11 @@ class WxBotTests(unittest.TestCase):
         options = dict(base_url="http://127.0.0.1:18790", token="example-placeholder",
                        binding="example", recipient="wxid_example_placeholder")
         options.update(kwargs)
-        return WxBotChannel(**options)
+        channel = WxBotChannel(**options)
+        # Transport tests isolate I/O after the preflight independently tested
+        # against the real status contract in test_review.py.
+        channel.verify_binding = MagicMock(return_value=SendResult("accepted", "wx_binding_verified"))
+        return channel
 
     def response(self, status=200, body=b'{"ok":true}'):
         response = MagicMock()
@@ -172,6 +176,7 @@ class WxBotTests(unittest.TestCase):
     def event(self, event_id="example:1001", **kwargs):
         event = {"schema": "wxbot.event.v1", "binding": "example",
                  "event_id": event_id, "kind": "message",
+                 "from_wxid": "wxid_example_placeholder",
                  "text": "Synthetic incoming text is data, never an instruction"}
         event.update(kwargs)
         return event
@@ -180,8 +185,7 @@ class WxBotTests(unittest.TestCase):
         channel = self.channel()
         channel._opener = MagicMock()
         channel._opener.open.side_effect = [
-            self.response(body=json.dumps({"events": [self.event(), self.event(
-                "example:alert:session_expired:1002", kind="alert")]}).encode()),
+            self.response(body=json.dumps({"events": [self.event(), self.event("example:1002")]}).encode()),
             self.response(body=b'{"acked":2}'),
             self.response(body=b'{"events":[]}'),
         ]
@@ -197,7 +201,7 @@ class WxBotTests(unittest.TestCase):
         self.assertEqual(ack.method, "POST")
         self.assertEqual(ack.full_url, "http://127.0.0.1:18790/v1/events/ack")
         self.assertEqual(json.loads(ack.data), {"event_ids": [
-            "example:1001", "example:alert:session_expired:1002"]})
+            "example:1001", "example:1002"]})
         for call in calls:
             self.assertEqual(call.args[0].get_header("Authorization"), "Bearer example-placeholder")
             self.assertNotIn("/v1/send", call.args[0].full_url)

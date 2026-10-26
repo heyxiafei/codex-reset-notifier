@@ -1,7 +1,7 @@
 """Map public API metadata; never infer personal quota or promote an estimate."""
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+import re
 
 
 def timestamp(value):
@@ -23,15 +23,10 @@ def clean(value, limit=240):
 def source_url(value):
     if not isinstance(value, str) or len(value) > 1000:
         return None
-    try:
-        parts = urlsplit(value)
-        if (parts.scheme == "https" and parts.hostname in {"x.com", "twitter.com"}
-                and not parts.username and not parts.password and parts.port in {None, 443}
-                and "/status/" in parts.path and not parts.query and not parts.fragment):
-            return value
-    except ValueError:
-        pass
-    return None
+    # Do not let a URL parser silently discard embedded controls, whitespace,
+    # or unicode formatting before returning an unvalidated original string.
+    match = re.fullmatch(r"https://(x\.com|twitter\.com)/([A-Za-z0-9_]{1,15}/status|i/status)/([1-9][0-9]{0,24})/?", value)
+    return f"https://{match[1]}/{match[2]}/{match[3]}" if match else None
 
 
 @dataclass(frozen=True)
@@ -96,7 +91,8 @@ def notices(payload, cutoff, now):
             start, end = timestamp(estimate.get("from")), timestamp(estimate.get("through"))
             if start and end and start <= end:
                 basis_value = estimate.get("basis")
-                basis = {"source": "来源推算", "model": "模型推算"}.get(
+                basis = {"source": "来源推算", "model": "模型推算",
+                         "source_day": "来源日期推算（时段依历史习惯）", "history": "历史规律推算"}.get(
                     basis_value if isinstance(basis_value, str) else "", "依据未明确")
                 lines.append(f"⏳ 预计窗口：{start.isoformat()} 至 {end.isoformat()}（{basis}，不是完成确认）")
         lines += ["ℹ️ 这是公开消息状态，不代表你的个人额度已恢复。", f"🔗 原帖：{url}",
